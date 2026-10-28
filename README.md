@@ -4,7 +4,7 @@ Solana program (Pinocchio) that splits a token creator's fee stream between wall
 
 A coin launched on Raydium LaunchLab names this program's per-coin inbox PDA `["inbox", mint]` as its pool creator. The
 creator's share of trading fees arrives there as SOL. `distribute` books it into the coin record `["coin", mint]`: a
-platform share (basis points fixed at registration) and up to 10 slots (wallets or X / Telegram / GitHub handle ids)
+platform share (basis points fixed at registration) and up to 10 slots (wallets or X / Telegram / GitHub / Discord / TikTok handle ids)
 by their basis points. Wallet slots claim directly. A handle slot is bound once to a wallet by the binder key; claims of
 binder-bound slots are limited by a daily cap. Paused, the admin refunds every coin (dues to owners, unbound handles to
 the coin author) and closes the config.

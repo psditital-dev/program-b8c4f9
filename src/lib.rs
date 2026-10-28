@@ -1,6 +1,6 @@
 //! StonkMoney split: the pool creator of a StonkFun (Raydium LaunchLab) coin is this program's per-coin
 //! inbox PDA. StonkFun forwards the creator's share of the trading fee to that address as plain SOL;
-//! `distribute` books it into the coin's slots (wallets and X / Telegram / GitHub handles) and the
+//! `distribute` books it into the coin's slots (wallets and X / Telegram / GitHub / Discord / TikTok handles) and the
 //! platform share; owners claim. Handles are bound to a wallet by our server key (bounded: a daily cap
 //! on what handle claims may pay out). See README.md.
 #![cfg_attr(not(test), no_std)]
@@ -47,7 +47,7 @@ const CONFIG: u8 = 1;
 const COIN: u8 = 2;
 // slot kinds: a plain wallet (owner fixed at registration) or a social handle (owner bound by our server)
 const WALLET: u8 = 0;
-const MAX_KIND: u8 = 3; // 1 X, 2 Telegram, 3 GitHub
+const MAX_KIND: u8 = 5; // 1 X, 2 Telegram, 3 GitHub, 4 Discord, 5 TikTok (reserved: the site turns it on later)
 const BOUND: u8 = 1; // slot flag: owner set by the binder, claims count toward the daily cap
 
 mod c {
