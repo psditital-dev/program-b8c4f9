@@ -37,7 +37,9 @@ const MAX_PLAT_BPS: u16 = 5_000;
 const MAX_TIP: u64 = 50_000;
 const DAY: i64 = 86_400;
 // defaults set by init_config, changed by set_config
-const PLAT_BPS: u16 = 2_000; // TZ: 1 of the 5 %, i.e. a fifth of the creator's fee stream
+const PLAT_BPS: u16 = 1_000; // TZ v2: 10 % of the creator's fee stream
+const PERIOD: i64 = 5 * DAY; // TZ update 3: dues not claimed for this long go to the buyback wallet (switch off by default)
+const MIN_PERIOD: i64 = 60;
 const CAP: u64 = 5_000_000_000; // handle claims may pay out at most 5 SOL a day
 const TIP: u64 = 10_000; // to whoever pays the fee of a distribute / sponsored claim
 
@@ -61,7 +63,10 @@ mod c {
     pub const USED: usize = 149; // u64
     pub const TIP: usize = 157; // u64
     pub const OPEN: usize = 165; // u32, registered coins not yet refunded
-    pub const LEN: usize = 169;
+    pub const EXPIRE: usize = 169; // u8, 1 = unclaimed dues may be swept to BUYBACK (TZ update 3)
+    pub const PERIOD: usize = 170; // i64, seconds without a claim before a sweep
+    pub const BUYBACK: usize = 178; // the team's $STONKMONEY buyback-and-burn wallet
+    pub const LEN: usize = 210;
 }
 mod k {
     pub const BUMP: usize = 1;
@@ -82,7 +87,8 @@ mod s {
     pub const BPS: usize = 34; // u16, share of the after-platform rest
     pub const OWNER: usize = 36; // zero until bound
     pub const DUE: usize = 68; // u64
-    pub const LEN: usize = 76;
+    pub const SINCE: usize = 76; // i64, registration or the last claim / sweep: the unclaimed clock
+    pub const LEN: usize = 84;
 }
 
 #[repr(u32)]
@@ -98,6 +104,8 @@ enum Error {
     CapReached,
     PayoutBelowRent,
     CoinsOpen,
+    NotExpired,
+    Expired,
 }
 fn err(e: Error) -> ProgramError {
     ProgramError::Custom(e as u32)
@@ -258,6 +266,11 @@ fn takes(to: &AccountView, amount: u64) -> Result<bool, ProgramError> {
 }
 /// A slot owner may not be zero, this program, the system program, or our own config / coin / inbox
 /// (paying one of those to itself or back into the inbox would strand money).
+/// TZ update 3 switched on and the slot unclaimed for `period`: its due belongs to the buyback wallet.
+fn overdue(cd: &[u8], kd: &[u8], o: usize, now: i64) -> Result<bool, ProgramError> {
+    let since = i64::from_le_bytes(rd(kd, o + s::SINCE)?);
+    Ok(cd[c::EXPIRE] == 1 && now.saturating_sub(since) >= i64::from_le_bytes(rd(cd, c::PERIOD)?))
+}
 fn payee_ok(x: &Address, cfg: &Address, coin_acc: &Address, inb: &Address) -> bool {
     *x != ZERO && x != &ID && *x != SYSTEM && x != cfg && x != coin_acc && x != inb
 }
@@ -305,6 +318,7 @@ pub fn process_instruction(pid: &Address, a: &mut [AccountView], d: &[u8]) -> Pr
         7 => claim_platform(a),
         8 => refund_coin(a),
         9 => close_config(a),
+        10 => expire(a, args),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -352,13 +366,15 @@ fn init_config(a: &mut [AccountView]) -> ProgramResult {
     cd[c::PAUSED] = 1; // opened by the admin when ready
     put(&mut cd, c::CAP, &CAP.to_le_bytes())?;
     put(&mut cd, c::TIP, &TIP.to_le_bytes())?;
+    put(&mut cd, c::PERIOD, &PERIOD.to_le_bytes())?;
+    put(&mut cd, c::BUYBACK, platform.address().as_ref())?; // until the admin names the buyback wallet
     save(cfg, &cd)
 }
 
-/// [admin(S), config(W), platform, new_admin(S) (may be the same key), binder];
-/// args: plat_bps u16 (<= 5000), paused u8, cap u64, tip u64 (<= 50 000).
+/// [admin(S), config(W), platform, new_admin(S) (may be the same key), binder, buyback];
+/// args: plat_bps u16 (<= 5000), paused u8, cap u64, tip u64 (<= 50 000), expire u8, period i64 (>= 60 s).
 fn set_config(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
-    let [admin, cfg, platform, new_admin, binder, ..] = a else {
+    let [admin, cfg, platform, new_admin, binder, buyback, ..] = a else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     let mut cd = config(cfg)?;
@@ -368,7 +384,17 @@ fn set_config(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let paused = byte(d, 2)?;
     let cap = u64_at(d, 3)?;
     let tip = u64_at(d, 11)?;
-    need(plat_bps <= MAX_PLAT_BPS && paused <= 1 && tip <= MAX_TIP, Error::BadParams)?;
+    let expire = byte(d, 19)?;
+    let period = i64::from_le_bytes(rd(d, 20)?);
+    need(plat_bps <= MAX_PLAT_BPS && paused <= 1 && tip <= MAX_TIP && expire <= 1 && period >= MIN_PERIOD, Error::BadParams)?;
+    if *buyback.address() != key(&cd, c::BUYBACK)? {
+        let b = buyback.address();
+        need(*b != ZERO && b != &ID && b != cfg.address() && *b != SYSTEM, Error::BadParams)?;
+        need(!buyback.executable() && !buyback.owned_by(&SYSVAR) && !buyback.owned_by(&ID) && !RESERVED.contains(b), Error::BadParams)?;
+    }
+    put(&mut cd, c::BUYBACK, buyback.address().as_ref())?;
+    cd[c::EXPIRE] = expire;
+    put(&mut cd, c::PERIOD, &period.to_le_bytes())?;
     let same = *new_admin.address() == key(&cd, c::ADMIN)?
         && *platform.address() == key(&cd, c::PLATFORM)?
         && *binder.address() == key(&cd, c::BINDER)?;
@@ -430,6 +456,7 @@ fn register(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     put(&mut kd, k::MINT, m)?;
     put(&mut kd, k::AUTHOR, author.address().as_ref())?;
     let mut sum = 0u64;
+    let now = Clock::get()?.unix_timestamp;
     for i in 0..n {
         let (src, o) = (1 + i * 35, slot(i));
         let kind = byte(d, src)?;
@@ -444,6 +471,7 @@ fn register(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
         kd[o + s::KIND] = kind;
         put(&mut kd, o + s::KEY, &id)?;
         put(&mut kd, o + s::BPS, &bps.to_le_bytes())?;
+        put(&mut kd, o + s::SINCE, &now.to_le_bytes())?;
         if kind == WALLET {
             let w = Address::new_from_array(id);
             need(payee_ok(&w, cfg.address(), coin_acc.address(), inb.address()), Error::BadParams)?;
@@ -524,6 +552,7 @@ fn claim(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     need(i < kd[k::N] as usize, Error::BadParams)?;
     let o = slot(i);
     need(key(&kd, o + s::OWNER)? == *owner.address(), Error::Unauthorized)?;
+    need(!overdue(&cd, &kd, o, Clock::get()?.unix_timestamp)?, Error::Expired)?; // it is the buyback's: `expire`
     let mut amount = u64_at(&kd, o + s::DUE)?;
     if kd[o + s::FLAGS] & BOUND != 0 {
         let day = Clock::get()?.unix_timestamp / DAY;
@@ -546,6 +575,41 @@ fn claim(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     pay(coin_acc, owner, net)?;
     let due = sub(u64_at(&kd, o + s::DUE)?, amount)?;
     put(&mut kd, o + s::DUE, &due.to_le_bytes())?;
+    put(&mut kd, o + s::SINCE, &Clock::get()?.unix_timestamp.to_le_bytes())?;
+    save(coin_acc, &kd)
+}
+
+/// TZ update 3, only while the admin switched it on. Permissionless. [config, coin(W), buyback(W), caller(W)];
+/// args: slot u8. A slot with nothing claimed for `period` since registration or its last claim / sweep: its whole
+/// due goes to the buyback wallet (the team buys back and burns $STONKMONEY with it); the caller gets the tip
+/// (min(tip, 1 %)). The clock restarts.
+fn expire(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    let [cfg, coin_acc, buyback, caller, ..] = a else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    let cd = config(cfg)?;
+    need(cd[c::EXPIRE] == 1, Error::NotExpired)?;
+    need(buyback.address() == &key(&cd, c::BUYBACK)?, Error::Unauthorized)?;
+    let mut kd = coin(coin_acc)?;
+    let inb = Address::create_program_address(&[b"inbox", &kd[k::MINT..k::MINT + 32], &[kd[k::IBUMP]]], &ID)
+        .map_err(|_| err(Error::BadAccount))?;
+    need(payee_ok(buyback.address(), cfg.address(), coin_acc.address(), &inb), Error::BadAccount)?;
+    let i = byte(d, 0)? as usize;
+    need(i < kd[k::N] as usize, Error::BadParams)?;
+    let o = slot(i);
+    let now = Clock::get()?.unix_timestamp;
+    let since = i64::from_le_bytes(rd(&kd, o + s::SINCE)?);
+    need(now.saturating_sub(since) >= i64::from_le_bytes(rd(&cd, c::PERIOD)?), Error::NotExpired)?;
+    let due = u64_at(&kd, o + s::DUE)?;
+    need(due > 0, Error::NothingToClaim)?;
+    let tip = u64_at(&cd, c::TIP)?.min(due / 100);
+    let tip = if caller.address() != coin_acc.address() && caller.address() != buyback.address() && takes(caller, tip)? { tip } else { 0 };
+    let net = sub(due, tip)?;
+    need(takes(buyback, net)?, Error::PayoutBelowRent)?;
+    pay(coin_acc, caller, tip)?;
+    pay(coin_acc, buyback, net)?;
+    put(&mut kd, o + s::DUE, &0u64.to_le_bytes())?;
+    put(&mut kd, o + s::SINCE, &now.to_le_bytes())?;
     save(coin_acc, &kd)
 }
 
@@ -568,13 +632,13 @@ fn claim_platform(a: &mut [AccountView]) -> ProgramResult {
     save(coin_acc, &kd)
 }
 
-/// Wind-down, while paused. [admin(S), config(W), coin(W), inbox(W), author(W), platform(W), system,
+/// Wind-down, while paused. [admin(S), config(W), coin(W), inbox(W), author(W), platform(W), system, buyback(W),
 /// then one account per slot in slot order (its owner; the author for an unbound handle)].
 /// Books the inbox, pays every due: slot -> owner, unbound handle -> author; an owner that cannot take
 /// it -> author, then platform (never blocks). Platform due -> platform. The inbox reserve and the coin
 /// rent go back to the author; the coin account closes.
 fn refund_coin(a: &mut [AccountView]) -> ProgramResult {
-    let [admin, cfg, coin_acc, inb, author, platform, sys, owners @ ..] = a else {
+    let [admin, cfg, coin_acc, inb, author, platform, sys, buyback, owners @ ..] = a else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     let mut cd = config(cfg)?;
@@ -582,6 +646,9 @@ fn refund_coin(a: &mut [AccountView]) -> ProgramResult {
     need(admin.address() == &key(&cd, c::ADMIN)?, Error::Unauthorized)?;
     need(cd[c::PAUSED] == 1, Error::NotPaused)?;
     need(platform.address() == &key(&cd, c::PLATFORM)?, Error::Unauthorized)?;
+    need(buyback.address() == &key(&cd, c::BUYBACK)?, Error::Unauthorized)?;
+    need(buyback.is_writable(), Error::BadAccount)?;
+    let now = Clock::get()?.unix_timestamp;
     system(sys)?;
     let mut kd = coin(coin_acc)?;
     inbox(inb, &kd)?;
@@ -606,7 +673,9 @@ fn refund_coin(a: &mut [AccountView]) -> ProgramResult {
         need(dest.address() == &want, Error::BadAccount)?;
         // a plain wallet must come writable: only addresses the runtime never lets write may be read-only
         need(dest.is_writable() || dest.executable() || dest.owned_by(&SYSVAR) || RESERVED.contains(dest.address()), Error::BadAccount)?;
-        if payee_ok(dest.address(), cfg.address(), coin_acc.address(), inb.address()) && takes(dest, due)? {
+        if overdue(&cd, &kd, o, now)? && payee_ok(buyback.address(), cfg.address(), coin_acc.address(), inb.address()) && takes(buyback, due)? {
+            pay(coin_acc, buyback, due)?; // TZ update 3: unclaimed past the period belongs to the buyback
+        } else if payee_ok(dest.address(), cfg.address(), coin_acc.address(), inb.address()) && takes(dest, due)? {
             pay(coin_acc, dest, due)?;
         } else if takes(author, due)? {
             pay(coin_acc, author, due)?;
